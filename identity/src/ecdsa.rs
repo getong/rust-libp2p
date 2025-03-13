@@ -96,7 +96,7 @@ impl SecretKey {
     /// Generate a new random ECDSA secret key.
     #[cfg(feature = "rand")]
     pub fn generate() -> SecretKey {
-        SecretKey(SigningKey::random(&mut rand::thread_rng()))
+        SecretKey(SigningKey::random(&mut rand::rng()))
     }
 
     /// Sign a message with this secret key, producing a DER-encoded ECDSA signature.

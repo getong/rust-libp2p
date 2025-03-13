@@ -345,7 +345,7 @@ mod tests {
     use crate::record::store::MemoryStore;
 
     fn rand_put_record_job() -> PutRecordJob {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let id = PeerId::random();
         let replicate_interval = Duration::from_secs(rng.gen_range(1..60));
         let publish_interval = Some(replicate_interval * rng.gen_range(1..10));
@@ -354,7 +354,7 @@ mod tests {
     }
 
     fn rand_add_provider_job() -> AddProviderJob {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let interval = Duration::from_secs(rng.gen_range(1..60));
         AddProviderJob::new(interval)
     }

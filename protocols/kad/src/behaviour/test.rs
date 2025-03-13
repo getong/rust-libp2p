@@ -33,7 +33,7 @@ use libp2p_noise as noise;
 use libp2p_swarm::{self as swarm, Swarm, SwarmEvent};
 use libp2p_yamux as yamux;
 use quickcheck::*;
-use rand::{random, rngs::StdRng, thread_rng, Rng, SeedableRng};
+use rand::{random, rngs::StdRng, rng, Rng, SeedableRng};
 
 use super::*;
 use crate::{
@@ -137,7 +137,7 @@ fn build_fully_connected_nodes_with_config(
 }
 
 fn random_multihash() -> Multihash<64> {
-    Multihash::wrap(SHA_256_MH, &thread_rng().gen::<[u8; 32]>()).unwrap()
+    Multihash::wrap(SHA_256_MH, &rng().gen::<[u8; 32]>()).unwrap()
 }
 
 #[derive(Clone, Debug)]
@@ -315,7 +315,7 @@ fn query_iter() {
         }))
     }
 
-    let mut rng = thread_rng();
+    let mut rng = rng();
     for _ in 0..10 {
         run(&mut rng)
     }
@@ -1176,7 +1176,7 @@ fn disjoint_query_does_not_finish_before_all_paths_did() {
     let mut bob = build_node();
 
     let key = Key::from(
-        Multihash::<64>::wrap(SHA_256_MH, &thread_rng().gen::<[u8; 32]>())
+        Multihash::<64>::wrap(SHA_256_MH, &rng().gen::<[u8; 32]>())
             .expect("32 array to fit into 64 byte multihash"),
     );
     let record_bob = Record::new(key.clone(), b"bob".to_vec());

@@ -116,7 +116,7 @@ impl Keypair {
     /// Create a new X25519 keypair.
     pub(crate) fn new() -> Keypair {
         let mut sk_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut sk_bytes);
+        rand::rng().fill(&mut sk_bytes);
         let sk = SecretKey(sk_bytes); // Copy
         sk_bytes.zeroize();
         Self::from(sk)

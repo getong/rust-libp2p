@@ -737,7 +737,7 @@ async fn open_outbound_streams<P: Provider + Spawn, const BUFFER_SIZE: usize>(
                 }
 
                 let mut data = vec![0; BUFFER_SIZE];
-                rand::thread_rng().fill_bytes(&mut data);
+                rand::rng().fill_bytes(&mut data);
 
                 let mut received = Vec::new();
 

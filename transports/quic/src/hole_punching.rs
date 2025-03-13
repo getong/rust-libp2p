@@ -30,7 +30,7 @@ async fn punch_holes<P: Provider>(
     remote_addr: SocketAddr,
 ) -> Result<Infallible, Error> {
     loop {
-        let contents: Vec<u8> = rand::thread_rng()
+        let contents: Vec<u8> = rand::rng()
             .sample_iter(distributions::Standard)
             .take(64)
             .collect();
@@ -39,7 +39,7 @@ async fn punch_holes<P: Provider>(
 
         P::send_to(&socket, &contents, remote_addr).await?;
 
-        let sleep_duration = Duration::from_millis(rand::thread_rng().gen_range(10..=200));
+        let sleep_duration = Duration::from_millis(rand::rng().gen_range(10..=200));
         P::sleep(sleep_duration).await;
     }
 }

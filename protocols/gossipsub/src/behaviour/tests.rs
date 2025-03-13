@@ -3349,7 +3349,7 @@ fn test_scoring_p1() {
 }
 
 fn random_message(seq: &mut u64, topics: &[TopicHash]) -> RawMessage {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     *seq += 1;
     RawMessage {
         source: Some(PeerId::random()),

@@ -416,7 +416,7 @@ mod tests {
     fn fill_outgoing() -> (Swarm<Behaviour>, Multiaddr, u32) {
         use rand::Rng;
 
-        let outgoing_limit = rand::thread_rng().gen_range(1..10);
+        let outgoing_limit = rand::rng().gen_range(1..10);
 
         let mut network = Swarm::new_ephemeral(|_| {
             Behaviour::new(

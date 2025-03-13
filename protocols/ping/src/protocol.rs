@@ -52,7 +52,7 @@ pub(crate) async fn send_ping<S>(mut stream: S) -> io::Result<(S, Duration)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let payload: [u8; PING_SIZE] = thread_rng().sample(distributions::Standard);
+    let payload: [u8; PING_SIZE] = rng().sample(distributions::Standard);
     stream.write_all(&payload).await?;
     stream.flush().await?;
     let started = Instant::now();
@@ -93,7 +93,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_pong() {
-        let mem_addr = multiaddr![Memory(thread_rng().gen::<u64>())];
+        let mem_addr = multiaddr![Memory(rng().gen::<u64>())];
         let mut transport = MemoryTransport::new().boxed();
         transport.listen_on(ListenerId::next(), mem_addr).unwrap();
 
