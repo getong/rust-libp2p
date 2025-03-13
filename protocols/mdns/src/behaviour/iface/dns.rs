@@ -278,7 +278,7 @@ fn random_string(length: usize) -> String {
 fn generate_peer_name() -> Vec<u8> {
     // Use a variable-length random string for mDNS peer name.
     // See https://github.com/libp2p/rust-libp2p/pull/2311/
-    let peer_name = random_string(32 + rng().gen_range(0..32));
+    let peer_name = random_string(32 + rng().random_range(0..32));
 
     // allocate with a little extra padding for QNAME encoding
     let mut peer_name_bytes = Vec::with_capacity(peer_name.len() + 32);
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_random_string() {
-        let varsize = rng().gen_range(0..32);
+        let varsize = rng().random_range(0..32);
         let size = 32 + varsize;
         let name = random_string(size);
         assert_eq!(name.len(), size);

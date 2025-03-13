@@ -137,7 +137,7 @@ fn build_fully_connected_nodes_with_config(
 }
 
 fn random_multihash() -> Multihash<64> {
-    Multihash::wrap(SHA_256_MH, &rng().gen::<[u8; 32]>()).unwrap()
+    Multihash::wrap(SHA_256_MH, &rng().random::<[u8; 32]>()).unwrap()
 }
 
 #[derive(Clone, Debug)]
@@ -155,14 +155,14 @@ fn bootstrap() {
     fn prop(seed: Seed) {
         let mut rng = StdRng::from_seed(seed.0);
 
-        let num_total = rng.gen_range(2..20);
+        let num_total = rng.random_range(2..20);
         // When looking for the closest node to a key, Kademlia considers
         // K_VALUE nodes to query at initialization. If `num_group` is larger
         // than K_VALUE the remaining locally known nodes will not be
         // considered. Given that no other node is aware of them, they would be
         // lost entirely. To prevent the above restrict `num_group` to be equal
         // or smaller than K_VALUE.
-        let num_group = rng.gen_range(1..(num_total % K_VALUE.get()) + 2);
+        let num_group = rng.random_range(1..(num_total % K_VALUE.get()) + 2);
 
         let mut cfg = Config::new(PROTOCOL_NAME);
         // Disabling periodic bootstrap and automatic bootstrap to prevent the bootstrap from
@@ -246,7 +246,7 @@ fn query_iter() {
     }
 
     fn run(rng: &mut impl Rng) {
-        let num_total = rng.gen_range(2..20);
+        let num_total = rng.random_range(2..20);
         let mut config = Config::new(PROTOCOL_NAME);
         // Disabling periodic bootstrap and automatic bootstrap to prevent the bootstrap from
         // triggering automatically.
@@ -558,7 +558,7 @@ fn put_record() {
     fn prop(records: Vec<Record>, seed: Seed, filter_records: bool, drop_records: bool) {
         let mut rng = StdRng::from_seed(seed.0);
         let replication_factor =
-            NonZeroUsize::new(rng.gen_range(1..(K_VALUE.get() / 2) + 1)).unwrap();
+            NonZeroUsize::new(rng.random_range(1..(K_VALUE.get() / 2) + 1)).unwrap();
         // At least 4 nodes, 1 under test + 3 bootnodes.
         let num_total = usize::max(4, replication_factor.get() * 2);
 
@@ -931,7 +931,7 @@ fn add_provider() {
     fn prop(keys: Vec<record::Key>, seed: Seed) {
         let mut rng = StdRng::from_seed(seed.0);
         let replication_factor =
-            NonZeroUsize::new(rng.gen_range(1..(K_VALUE.get() / 2) + 1)).unwrap();
+            NonZeroUsize::new(rng.random_range(1..(K_VALUE.get() / 2) + 1)).unwrap();
         // At least 4 nodes, 1 under test + 3 bootnodes.
         let num_total = usize::max(4, replication_factor.get() * 2);
 
@@ -1176,7 +1176,7 @@ fn disjoint_query_does_not_finish_before_all_paths_did() {
     let mut bob = build_node();
 
     let key = Key::from(
-        Multihash::<64>::wrap(SHA_256_MH, &rng().gen::<[u8; 32]>())
+        Multihash::<64>::wrap(SHA_256_MH, &rng().random::<[u8; 32]>())
             .expect("32 array to fit into 64 byte multihash"),
     );
     let record_bob = Record::new(key.clone(), b"bob".to_vec());

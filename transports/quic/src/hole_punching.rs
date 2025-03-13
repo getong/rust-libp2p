@@ -39,7 +39,7 @@ async fn punch_holes<P: Provider>(
 
         P::send_to(&socket, &contents, remote_addr).await?;
 
-        let sleep_duration = Duration::from_millis(rand::rng().gen_range(10..=200));
+        let sleep_duration = Duration::from_millis(rand::rng().random_range(10..=200));
         P::sleep(sleep_duration).await;
     }
 }

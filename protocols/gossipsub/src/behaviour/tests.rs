@@ -3353,9 +3353,9 @@ fn random_message(seq: &mut u64, topics: &[TopicHash]) -> RawMessage {
     *seq += 1;
     RawMessage {
         source: Some(PeerId::random()),
-        data: (0..rng.gen_range(10..30)).map(|_| rng.gen()).collect(),
+        data: (0..rng.random_range(10..30)).map(|_| rng.gen()).collect(),
         sequence_number: Some(*seq),
-        topic: topics[rng.gen_range(0..topics.len())].clone(),
+        topic: topics[rng.random_range(0..topics.len())].clone(),
         signature: None,
         key: None,
         validated: true,
