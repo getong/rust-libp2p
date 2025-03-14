@@ -38,7 +38,7 @@ impl Certificate {
         R: CryptoRng + Rng,
     {
         let mut params = rcgen::CertificateParams::new(vec![
-            rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16)
+            rand::distributions::Alphanumeric.sample_string(&mut rand::rng(), 16)
         ]);
         params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
         Ok(Self {
@@ -100,13 +100,13 @@ enum Kind {
 
 #[cfg(all(test, feature = "pem"))]
 mod test {
-    use rand::thread_rng;
+    use rand::rng;
 
     use super::*;
 
     #[test]
     fn test_certificate_serialize_pem_and_from_pem() {
-        let cert = Certificate::generate(&mut thread_rng()).unwrap();
+        let cert = Certificate::generate(&mut rng()).unwrap();
 
         let pem = cert.serialize_pem();
         let loaded_cert = Certificate::from_pem(&pem).unwrap();

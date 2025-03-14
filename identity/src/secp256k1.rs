@@ -91,7 +91,7 @@ impl SecretKey {
     /// Generate a new random Secp256k1 secret key.
     #[cfg(feature = "rand")]
     pub fn generate() -> SecretKey {
-        SecretKey(libsecp256k1::SecretKey::random(&mut rand::thread_rng()))
+        SecretKey(libsecp256k1::SecretKey::random(&mut rand::rng()))
     }
 
     /// Create a secret key from a byte slice, zeroing the slice on success.
