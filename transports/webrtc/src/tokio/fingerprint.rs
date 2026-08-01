@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use webrtc::dtls_transport::dtls_fingerprint::RTCDtlsFingerprint;
+use rtc::peer_connection::transport::RTCDtlsFingerprint;
 
 const SHA256: &str = "sha-256";
 

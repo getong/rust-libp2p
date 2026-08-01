@@ -12,6 +12,7 @@ categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 async-trait = "0.1"
+bytes = { workspace = true }
 futures = { workspace = true }
 futures-timer = { workspace = true }
 hex = "0.4"
@@ -22,17 +23,17 @@ libp2p-identity = { workspace = true }
 libp2p-webrtc-utils = { workspace = true }
 multihash = { workspace = true }
 rand = { workspace = true }
-rcgen = { workspace = true }
+rcgen = "0.14"
+rtc = { version = "0.20", optional = true }
 stun = "0.17"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"], optional = true }
-tokio-util = { version = "0.7", features = ["compat"], optional = true }
 tracing = { workspace = true }
-webrtc = { version = "0.17", optional = true }
+webrtc = { version = "0.20", default-features = false, features = ["runtime-tokio"], optional = true }
 
 [features]
-tokio = ["dep:tokio", "dep:tokio-util", "dep:webrtc", "if-watch/tokio"]
-pem = ["webrtc?/pem"]
+tokio = ["dep:rtc", "dep:tokio", "dep:webrtc", "if-watch/tokio"]
+pem = ["rtc?/pem"]
 
 [dev-dependencies]
 libp2p-identity = { workspace = true, features = ["rand"] }

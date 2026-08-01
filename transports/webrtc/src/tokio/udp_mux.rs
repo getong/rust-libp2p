@@ -20,34 +20,32 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io,
-    io::ErrorKind,
+    fmt,
+    future::Future,
+    io::{self, ErrorKind, IoSliceMut},
     net::SocketAddr,
-    sync::Arc,
+    pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Duration,
 };
 
-use async_trait::async_trait;
-use futures::{
-    StreamExt,
-    channel::oneshot,
-    future::{BoxFuture, FutureExt, OptionFuture},
-    stream::FuturesUnordered,
-};
+use futures::{channel::mpsc, prelude::*, ready};
 use stun::{
     attributes::ATTR_USERNAME,
     message::{Message as STUNMessage, is_message as is_stun_message},
 };
-use thiserror::Error;
 use tokio::{io::ReadBuf, net::UdpSocket};
-use webrtc::{
-    ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter},
-    util::{Conn, Error},
+use webrtc::runtime::{
+    AsyncInterval, AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket, JoinHandle, RecvMeta, Runtime,
+    Transmit,
 };
 
 use crate::tokio::req_res_chan;
 
-const RECEIVE_MTU: usize = 8192;
+const RECEIVE_MTU: usize = 64 * 1024;
+const RECEIVE_QUEUE_CAPACITY: usize = 64;
+const SEND_QUEUE_CAPACITY: usize = 64;
 
 /// A previously unseen address of a remote which has sent us an ICE binding request.
 #[derive(Debug)]
@@ -56,80 +54,62 @@ pub(crate) struct NewAddr {
     pub(crate) ufrag: String,
 }
 
-/// An event emitted by [`UDPMuxNewAddr`] when it's polled.
+/// An event emitted by [`UDPMuxNewAddr`] when it is polled.
 #[derive(Debug)]
 pub(crate) enum UDPMuxEvent {
-    /// Connection error. UDP mux should be stopped.
-    Error(std::io::Error),
-    /// Got a [`NewAddr`] from the socket.
+    Error(io::Error),
     NewAddr(NewAddr),
 }
 
-/// A modified version of [`webrtc::ice::udp_mux::UDPMuxDefault`].
-///
-/// - It has been rewritten to work without locks and channels instead.
-/// - It reports previously unseen addresses instead of ignoring them.
+#[derive(Debug)]
+struct Datagram {
+    data: Vec<u8>,
+    remote_addr: SocketAddr,
+}
+
+#[derive(Debug)]
+struct Route {
+    incoming: mpsc::Sender<Datagram>,
+    remote_addrs: HashSet<SocketAddr>,
+}
+
+/// Demultiplexes one listening UDP socket into one socket-like handle per ICE ufrag.
 pub(crate) struct UDPMuxNewAddr {
     udp_sock: UdpSocket,
-
     listen_addr: SocketAddr,
-
-    /// Maps from ufrag to the underlying connection.
-    conns: HashMap<String, UDPMuxConn>,
-
-    /// Maps from socket address to the underlying connection.
-    address_map: HashMap<SocketAddr, UDPMuxConn>,
-
-    /// Set of the new addresses to avoid sending the same address multiple times.
+    conns: HashMap<String, Route>,
+    address_map: HashMap<SocketAddr, String>,
     new_addrs: HashSet<SocketAddr>,
-
-    /// `true` when UDP mux is closed.
-    is_closed: bool,
-
-    send_buffer: Option<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
-
-    close_futures: FuturesUnordered<BoxFuture<'static, ()>>,
-    write_future: OptionFuture<BoxFuture<'static, ()>>,
-
-    close_command: req_res_chan::Receiver<(), Result<(), Error>>,
-    get_conn_command: req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
-    remove_conn_command: req_res_chan::Receiver<String, ()>,
-    registration_command: req_res_chan::Receiver<(UDPMuxConn, SocketAddr), ()>,
-    send_command: req_res_chan::Receiver<(Vec<u8>, SocketAddr), Result<usize, Error>>,
-
+    send_buffer: Option<(Vec<u8>, SocketAddr)>,
+    send_command: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    get_conn_command: req_res_chan::Receiver<String, io::Result<Arc<MuxConnection>>>,
     udp_mux_handle: Arc<UdpMuxHandle>,
-    udp_mux_writer_handle: Arc<UdpMuxWriterHandle>,
 }
 
 impl UDPMuxNewAddr {
-    pub(crate) fn listen_on(addr: SocketAddr) -> Result<Self, io::Error> {
+    pub(crate) fn listen_on(addr: SocketAddr) -> io::Result<Self> {
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
 
-        let tokio_socket = UdpSocket::from_std(std_sock)?;
-        let listen_addr = tokio_socket.local_addr()?;
-
-        let (udp_mux_handle, close_command, get_conn_command, remove_conn_command) =
-            UdpMuxHandle::new();
-        let (udp_mux_writer_handle, registration_command, send_command) = UdpMuxWriterHandle::new();
+        let udp_sock = UdpSocket::from_std(std_sock)?;
+        let listen_addr = udp_sock.local_addr()?;
+        let (get_conn_sender, get_conn_command) = req_res_chan::new(1);
+        let (send_sender, send_command) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let udp_mux_handle = Arc::new(UdpMuxHandle {
+            get_conn_sender,
+            send_sender: Arc::new(Mutex::new(send_sender)),
+        });
 
         Ok(Self {
-            udp_sock: tokio_socket,
+            udp_sock,
             listen_addr,
-            conns: HashMap::default(),
-            address_map: HashMap::default(),
-            new_addrs: HashSet::default(),
-            is_closed: false,
+            conns: HashMap::new(),
+            address_map: HashMap::new(),
+            new_addrs: HashSet::new(),
             send_buffer: None,
-            close_futures: FuturesUnordered::default(),
-            write_future: OptionFuture::default(),
-            close_command,
-            get_conn_command,
-            remove_conn_command,
-            registration_command,
             send_command,
-            udp_mux_handle: Arc::new(udp_mux_handle),
-            udp_mux_writer_handle: Arc::new(udp_mux_writer_handle),
+            get_conn_command,
+            udp_mux_handle,
         })
     }
 
@@ -138,442 +118,352 @@ impl UDPMuxNewAddr {
     }
 
     pub(crate) fn udp_mux_handle(&self) -> Arc<UdpMuxHandle> {
-        self.udp_mux_handle.clone()
+        Arc::clone(&self.udp_mux_handle)
     }
 
-    /// Create a muxed connection for a given ufrag.
-    fn create_muxed_conn(&self, ufrag: &str) -> Result<UDPMuxConn, Error> {
-        let local_addr = self.udp_sock.local_addr()?;
-
-        let params = UDPMuxConnParams {
-            local_addr,
-            key: ufrag.into(),
-            udp_mux: Arc::downgrade(
-                &(self.udp_mux_writer_handle.clone() as Arc<dyn UDPMuxWriter + Send + Sync>),
-            ),
-        };
-
-        Ok(UDPMuxConn::new(params))
-    }
-
-    /// Returns a muxed connection if the `ufrag` from the given STUN message matches an existing
-    /// connection.
-    fn conn_from_stun_message(
-        &self,
-        buffer: &[u8],
-        addr: &SocketAddr,
-    ) -> Option<Result<UDPMuxConn, ConnQueryError>> {
-        match ufrag_from_stun_message(buffer, true) {
-            Ok(ufrag) => {
-                if let Some(conn) = self.conns.get(&ufrag) {
-                    let associated_addrs = conn.get_addresses();
-                    // This basically ensures only one address is registered per ufrag.
-                    if associated_addrs.is_empty() || associated_addrs.contains(addr) {
-                        return Some(Ok(conn.clone()));
-                    } else {
-                        return Some(Err(ConnQueryError::UfragAlreadyTaken { associated_addrs }));
-                    }
-                }
-                None
-            }
-            Err(e) => {
-                tracing::debug!(address=%addr, "{}", e);
-                None
-            }
-        }
-    }
-
-    /// Reads from the underlying UDP socket and either reports a new address or proxies data to the
-    /// muxed connection.
-    pub(crate) fn poll(&mut self, cx: &mut Context) -> Poll<UDPMuxEvent> {
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<UDPMuxEvent> {
         let mut recv_buf = [0u8; RECEIVE_MTU];
 
         loop {
-            // => Send data to target
-            match self.send_buffer.take() {
-                None => {
-                    if let Poll::Ready(Some(((buf, target), response))) =
-                        self.send_command.poll_next_unpin(cx)
-                    {
-                        self.send_buffer = Some((buf, target, response));
-                        continue;
-                    }
+            self.remove_closed_connections();
+
+            if let Some((buf, target)) = self.send_buffer.take() {
+                match self.udp_sock.poll_send_to(cx, &buf, target) {
+                    Poll::Ready(Ok(_)) => continue,
+                    Poll::Ready(Err(err)) => return Poll::Ready(UDPMuxEvent::Error(err)),
+                    Poll::Pending => self.send_buffer = Some((buf, target)),
                 }
-                Some((buf, target, response)) => {
-                    match self.udp_sock.poll_send_to(cx, &buf, target) {
-                        Poll::Ready(result) => {
-                            let _ = response.send(result.map_err(|e| Error::Io(e.into())));
-                            continue;
-                        }
-                        Poll::Pending => {
-                            self.send_buffer = Some((buf, target, response));
-                        }
-                    }
-                }
-            }
-
-            // => Register a new connection
-            if let Poll::Ready(Some(((conn, addr), response))) =
-                self.registration_command.poll_next_unpin(cx)
-            {
-                let key = conn.key();
-
-                self.address_map
-                    .entry(addr)
-                    .and_modify(|e| {
-                        if e.key() != key {
-                            e.remove_address(&addr);
-                            *e = conn.clone();
-                        }
-                    })
-                    .or_insert_with(|| conn.clone());
-
-                // remove addr from new_addrs once conn is established
-                self.new_addrs.remove(&addr);
-
-                let _ = response.send(());
-
+            } else if let Poll::Ready(Some((buf, target))) = self.send_command.poll_next_unpin(cx) {
+                self.send_buffer = Some((buf, target));
                 continue;
             }
 
-            // => Get connection with the given ufrag
             if let Poll::Ready(Some((ufrag, response))) = self.get_conn_command.poll_next_unpin(cx)
             {
-                if self.is_closed {
-                    let _ = response.send(Err(Error::ErrUseClosedNetworkConn));
-                    continue;
-                }
+                let result = if self.conns.contains_key(&ufrag) {
+                    Err(io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        format!("UDP mux connection for ufrag {ufrag} already exists"),
+                    ))
+                } else {
+                    let (incoming, incoming_rx) = mpsc::channel(RECEIVE_QUEUE_CAPACITY);
+                    let conn = Arc::new(MuxConnection {
+                        ufrag: ufrag.clone(),
+                        incoming: Mutex::new(incoming_rx),
+                        send_sender: Arc::clone(&self.udp_mux_handle.send_sender),
+                    });
+                    self.conns.insert(
+                        ufrag,
+                        Route {
+                            incoming,
+                            remote_addrs: HashSet::new(),
+                        },
+                    );
+                    Ok(conn)
+                };
+                let _ = response.send(result);
+                continue;
+            }
 
-                if let Some(conn) = self.conns.get(&ufrag).cloned() {
-                    let _ = response.send(Ok(Arc::new(conn)));
-                    continue;
-                }
+            let mut read = ReadBuf::new(&mut recv_buf);
+            match self.udp_sock.poll_recv_from(cx, &mut read) {
+                Poll::Ready(Ok(remote_addr)) => {
+                    let packet = read.filled();
+                    let route = self.route_for_packet(packet, remote_addr);
 
-                let muxed_conn = match self.create_muxed_conn(&ufrag) {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        let _ = response.send(Err(e));
+                    if let Some(ufrag) = route {
+                        self.new_addrs.remove(&remote_addr);
+                        let Some(route) = self.conns.get_mut(&ufrag) else {
+                            continue;
+                        };
+                        route.remote_addrs.insert(remote_addr);
+                        self.address_map.insert(remote_addr, ufrag.clone());
+                        if let Err(err) = route.incoming.try_send(Datagram {
+                            data: packet.to_vec(),
+                            remote_addr,
+                        }) {
+                            tracing::debug!(
+                                address=%remote_addr,
+                                %ufrag,
+                                "Dropping UDP datagram: receive queue unavailable: {err}",
+                            );
+                        }
                         continue;
                     }
-                };
-                let mut close_rx = muxed_conn.close_rx();
 
-                self.close_futures.push({
-                    let ufrag = ufrag.clone();
-                    let udp_mux_handle = self.udp_mux_handle.clone();
-
-                    Box::pin(async move {
-                        let _ = close_rx.changed().await;
-                        udp_mux_handle.remove_conn_by_ufrag(&ufrag).await;
-                    })
-                });
-
-                self.conns.insert(ufrag, muxed_conn.clone());
-
-                let _ = response.send(Ok(Arc::new(muxed_conn) as Arc<dyn Conn + Send + Sync>));
-
-                continue;
-            }
-
-            // => Close UDPMux
-            if let Poll::Ready(Some(((), response))) = self.close_command.poll_next_unpin(cx) {
-                if self.is_closed {
-                    let _ = response.send(Err(Error::ErrAlreadyClosed));
-                    continue;
-                }
-
-                for (_, conn) in self.conns.drain() {
-                    conn.close();
-                }
-
-                // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
-                // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
-                self.address_map.clear();
-
-                // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
-                // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
-                self.new_addrs.clear();
-
-                let _ = response.send(Ok(()));
-
-                self.is_closed = true;
-
-                continue;
-            }
-
-            // => Remove connection with the given ufrag
-            if let Poll::Ready(Some((ufrag, response))) =
-                self.remove_conn_command.poll_next_unpin(cx)
-            {
-                // Pion's ice implementation has both `RemoveConnByFrag` and `RemoveConn`, but since
-                // `conns` is keyed on `ufrag` their implementation is equivalent.
-
-                if let Some(removed_conn) = self.conns.remove(&ufrag) {
-                    for address in removed_conn.get_addresses() {
-                        self.address_map.remove(&address);
-                    }
-                }
-
-                let _ = response.send(());
-
-                continue;
-            }
-
-            // => Remove closed connections
-            let _ = self.close_futures.poll_next_unpin(cx);
-
-            // => Write previously received data to local connections
-            match self.write_future.poll_unpin(cx) {
-                Poll::Ready(Some(())) => {
-                    self.write_future = OptionFuture::default();
-                    continue;
-                }
-                Poll::Ready(None) => {
-                    // => Read from the socket
-                    let mut read = ReadBuf::new(&mut recv_buf);
-
-                    match self.udp_sock.poll_recv_from(cx, &mut read) {
-                        Poll::Ready(Ok(addr)) => {
-                            // Find connection based on previously having seen this source address
-                            let conn = self.address_map.get(&addr);
-
-                            let conn = match conn {
-                                // If we couldn't find the connection based on source address, see
-                                // if this is a STUN message and if
-                                // so if we can find the connection based on ufrag.
-                                None if is_stun_message(read.filled()) => {
-                                    match self.conn_from_stun_message(read.filled(), &addr) {
-                                        Some(Ok(s)) => Some(s),
-                                        Some(Err(e)) => {
-                                            tracing::debug!(address=%&addr, "Error when querying existing connections: {}", e);
-                                            continue;
-                                        }
-                                        None => None,
-                                    }
-                                }
-                                Some(s) => Some(s.to_owned()),
-                                _ => None,
-                            };
-
-                            match conn {
-                                None => {
-                                    if !self.new_addrs.contains(&addr) {
-                                        match ufrag_from_stun_message(read.filled(), false) {
-                                            Ok(ufrag) => {
-                                                tracing::trace!(
-                                                    address=%&addr,
-                                                    %ufrag,
-                                                    "Notifying about new address from ufrag",
-                                                );
-                                                self.new_addrs.insert(addr);
-                                                return Poll::Ready(UDPMuxEvent::NewAddr(
-                                                    NewAddr { addr, ufrag },
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                tracing::debug!(
-                                                    address=%&addr,
-                                                    "Unknown address (non STUN packet: {})",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(conn) => {
-                                    let mut packet = vec![0u8; read.filled().len()];
-                                    packet.copy_from_slice(read.filled());
-                                    self.write_future = OptionFuture::from(Some(
-                                        async move {
-                                            if let Err(err) = conn.write_packet(&packet, addr).await
-                                            {
-                                                tracing::error!(
-                                                    address=%addr,
-                                                    "Failed to write packet: {}",
-                                                    err,
-                                                );
-                                            }
-                                        }
-                                        .boxed(),
-                                    ));
-                                }
+                    if !self.new_addrs.contains(&remote_addr) {
+                        match ufrag_from_stun_message(packet, false) {
+                            Ok(ufrag) => {
+                                self.new_addrs.insert(remote_addr);
+                                return Poll::Ready(UDPMuxEvent::NewAddr(NewAddr {
+                                    addr: remote_addr,
+                                    ufrag,
+                                }));
                             }
-
-                            continue;
-                        }
-                        Poll::Pending => {}
-                        Poll::Ready(Err(err)) if err.kind() == ErrorKind::TimedOut => {}
-                        Poll::Ready(Err(err)) if err.kind() == ErrorKind::ConnectionReset => {
-                            tracing::debug!("ConnectionReset by remote client {err:?}")
-                        }
-                        Poll::Ready(Err(err)) => {
-                            tracing::error!("Could not read udp packet: {}", err);
-                            return Poll::Ready(UDPMuxEvent::Error(err));
+                            Err(err) => tracing::debug!(
+                                address=%remote_addr,
+                                "Unknown address or invalid STUN packet: {err}",
+                            ),
                         }
                     }
+                    continue;
                 }
-                Poll::Pending => {}
+                Poll::Ready(Err(err)) if err.kind() == ErrorKind::TimedOut => continue,
+                Poll::Ready(Err(err)) if err.kind() == ErrorKind::ConnectionReset => {
+                    tracing::debug!("Connection reset by remote client: {err}");
+                    continue;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(UDPMuxEvent::Error(err)),
+                Poll::Pending => return Poll::Pending,
             }
+        }
+    }
 
-            return Poll::Pending;
+    fn route_for_packet(&self, packet: &[u8], remote_addr: SocketAddr) -> Option<String> {
+        if let Some(ufrag) = self.address_map.get(&remote_addr) {
+            return Some(ufrag.clone());
+        }
+        if !is_stun_message(packet) {
+            return None;
+        }
+
+        let ufrag = ufrag_from_stun_message(packet, true).ok()?;
+        let route = self.conns.get(&ufrag)?;
+        if route.remote_addrs.is_empty() || route.remote_addrs.contains(&remote_addr) {
+            Some(ufrag)
+        } else {
+            tracing::debug!(
+                address=%remote_addr,
+                %ufrag,
+                "ICE ufrag is already associated with another address",
+            );
+            None
+        }
+    }
+
+    fn remove_closed_connections(&mut self) {
+        let closed = self
+            .conns
+            .iter()
+            .filter(|(_, route)| route.incoming.is_closed())
+            .map(|(ufrag, _)| ufrag.clone())
+            .collect::<Vec<_>>();
+
+        for ufrag in closed {
+            if let Some(route) = self.conns.remove(&ufrag) {
+                for addr in route.remote_addrs {
+                    self.address_map.remove(&addr);
+                }
+            }
         }
     }
 }
 
-/// Handle which utilizes [`req_res_chan`] to transmit commands (e.g. remove connection) from the
-/// WebRTC ICE agent to [`UDPMuxNewAddr::poll`].
+/// Handle used by connection upgrades to obtain a socket for one ICE ufrag.
 pub(crate) struct UdpMuxHandle {
-    close_sender: req_res_chan::Sender<(), Result<(), Error>>,
-    get_conn_sender: req_res_chan::Sender<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
-    remove_sender: req_res_chan::Sender<String, ()>,
+    get_conn_sender: req_res_chan::Sender<String, io::Result<Arc<MuxConnection>>>,
+    send_sender: Arc<Mutex<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+}
+
+impl fmt::Debug for UdpMuxHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UdpMuxHandle").finish_non_exhaustive()
+    }
 }
 
 impl UdpMuxHandle {
-    /// Returns a new `UdpMuxHandle` and `close`, `get_conn` and `remove` receivers.
-    pub(crate) fn new() -> (
-        Self,
-        req_res_chan::Receiver<(), Result<(), Error>>,
-        req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
-        req_res_chan::Receiver<String, ()>,
-    ) {
-        let (sender1, receiver1) = req_res_chan::new(1);
-        let (sender2, receiver2) = req_res_chan::new(1);
-        let (sender3, receiver3) = req_res_chan::new(1);
-
-        let this = Self {
-            close_sender: sender1,
-            get_conn_sender: sender2,
-            remove_sender: sender3,
-        };
-
-        (this, receiver1, receiver2, receiver3)
-    }
-}
-
-#[async_trait]
-impl UDPMux for UdpMuxHandle {
-    async fn close(&self) -> Result<(), Error> {
-        self.close_sender
-            .send(())
-            .await
-            .map_err(|e| Error::Io(e.into()))??;
-
-        Ok(())
-    }
-
-    async fn get_conn(self: Arc<Self>, ufrag: &str) -> Result<Arc<dyn Conn + Send + Sync>, Error> {
-        let conn = self
-            .get_conn_sender
+    pub(crate) async fn get_conn(&self, ufrag: &str) -> io::Result<Arc<MuxConnection>> {
+        self.get_conn_sender
             .send(ufrag.to_owned())
             .await
-            .map_err(|e| Error::Io(e.into()))??;
+            .map_err(|err| io::Error::new(ErrorKind::BrokenPipe, err))?
+    }
+}
 
-        Ok(conn)
+/// A per-ufrag packet queue backed by the listener's shared UDP socket.
+pub(crate) struct MuxConnection {
+    ufrag: String,
+    incoming: Mutex<mpsc::Receiver<Datagram>>,
+    send_sender: Arc<Mutex<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+}
+
+impl fmt::Debug for MuxConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MuxConnection")
+            .field("ufrag", &self.ufrag)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct MuxedUdpSocket {
+    local_addr: SocketAddr,
+    conn: Arc<MuxConnection>,
+}
+
+impl AsyncUdpSocket for MuxedUdpSocket {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
     }
 
-    async fn remove_conn_by_ufrag(&self, ufrag: &str) {
-        if let Err(e) = self.remove_sender.send(ufrag.to_owned()).await {
-            tracing::debug!("Failed to send message through channel: {:?}", e);
+    fn poll_send(&self, cx: &mut Context<'_>, transmit: &Transmit<'_>) -> Poll<io::Result<usize>> {
+        let mut sender = self
+            .conn
+            .send_sender
+            .lock()
+            .map_err(|_| io::Error::other("UDP mux send queue lock poisoned"))?;
+        ready!(Pin::new(&mut *sender).poll_ready(cx))
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "UDP mux listener closed"))?;
+
+        let len = transmit.contents.len();
+        Pin::new(&mut *sender)
+            .start_send((transmit.contents.to_vec(), transmit.destination))
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "UDP mux listener closed"))?;
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-    }
-}
 
-/// Handle which utilizes [`req_res_chan`] to transmit commands from [`UDPMuxConn`] connections to
-/// [`UDPMuxNewAddr::poll`].
-pub(crate) struct UdpMuxWriterHandle {
-    registration_channel: req_res_chan::Sender<(UDPMuxConn, SocketAddr), ()>,
-    send_channel: req_res_chan::Sender<(Vec<u8>, SocketAddr), Result<usize, Error>>,
-}
-
-impl UdpMuxWriterHandle {
-    /// Returns a new `UdpMuxWriterHandle` and `registration`, `send` receivers.
-    fn new() -> (
-        Self,
-        req_res_chan::Receiver<(UDPMuxConn, SocketAddr), ()>,
-        req_res_chan::Receiver<(Vec<u8>, SocketAddr), Result<usize, Error>>,
-    ) {
-        let (sender1, receiver1) = req_res_chan::new(1);
-        let (sender2, receiver2) = req_res_chan::new(1);
-
-        let this = Self {
-            registration_channel: sender1,
-            send_channel: sender2,
+        let mut incoming = self
+            .conn
+            .incoming
+            .lock()
+            .map_err(|_| io::Error::other("UDP mux receive queue lock poisoned"))?;
+        let Some(datagram) = ready!(Pin::new(&mut *incoming).poll_next(cx)) else {
+            return Poll::Ready(Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "UDP mux listener closed",
+            )));
         };
+        if datagram.data.len() > bufs[0].len() {
+            return Poll::Ready(Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "UDP datagram exceeds receive buffer",
+            )));
+        }
 
-        (this, receiver1, receiver2)
+        let len = datagram.data.len();
+        bufs[0][..len].copy_from_slice(&datagram.data);
+        let mut recv_meta = RecvMeta::default();
+        recv_meta.addr = datagram.remote_addr;
+        recv_meta.len = len;
+        recv_meta.stride = len.max(1);
+        recv_meta.dst_ip = Some(self.local_addr.ip());
+        meta[0] = recv_meta;
+        Poll::Ready(Ok(1))
     }
 }
 
-#[async_trait]
-impl UDPMuxWriter for UdpMuxWriterHandle {
-    async fn register_conn_for_address(&self, conn: &UDPMuxConn, addr: SocketAddr) {
-        match self
-            .registration_channel
-            .send((conn.to_owned(), addr))
-            .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::debug!("Failed to send message through channel: {:?}", e);
-                return;
-            }
-        }
+/// Delegates runtime services to webrtc's Tokio runtime while replacing its UDP socket.
+#[derive(Debug)]
+pub(crate) struct MuxRuntime {
+    inner: Arc<dyn Runtime>,
+    conn: Arc<MuxConnection>,
+}
 
-        tracing::debug!(address=%addr, connection=%conn.key(), "Registered address for connection");
-    }
-
-    async fn send_to(&self, buf: &[u8], target: &SocketAddr) -> Result<usize, Error> {
-        let bytes_written = self
-            .send_channel
-            .send((buf.to_owned(), target.to_owned()))
-            .await
-            .map_err(|e| Error::Io(e.into()))??;
-
-        Ok(bytes_written)
+impl MuxRuntime {
+    pub(crate) fn new(conn: Arc<MuxConnection>) -> io::Result<Arc<Self>> {
+        let inner = webrtc::runtime::default_runtime()
+            .ok_or_else(|| io::Error::other("webrtc Tokio runtime is not enabled"))?;
+        Ok(Arc::new(Self { inner, conn }))
     }
 }
 
-/// Gets the ufrag from the given STUN message or returns an error, if failed to decode or the
-/// username attribute is not present.
-fn ufrag_from_stun_message(buffer: &[u8], local_ufrag: bool) -> Result<String, Error> {
-    let (result, message) = {
-        let mut m = STUNMessage::new();
+impl Runtime for MuxRuntime {
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> Box<dyn JoinHandle> {
+        self.inner.spawn(future)
+    }
 
-        (m.unmarshal_binary(buffer), m)
-    };
+    fn spawn_reactor(
+        &self,
+        reactor_pool_size: usize,
+        future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> Box<dyn JoinHandle> {
+        self.inner.spawn_reactor(reactor_pool_size, future)
+    }
 
-    if let Err(err) = result {
-        Err(Error::Other(format!("failed to handle decode ICE: {err}")))
-    } else {
-        let (attr, found) = message.attributes.get(ATTR_USERNAME);
-        if !found {
-            return Err(Error::Other("no username attribute in STUN message".into()));
-        }
+    fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        let local_addr = socket.local_addr()?;
+        drop(socket);
+        Ok(Arc::new(MuxedUdpSocket {
+            local_addr,
+            conn: Arc::clone(&self.conn),
+        }))
+    }
 
-        match String::from_utf8(attr.value) {
-            // Per the RFC this shouldn't happen
-            // https://datatracker.ietf.org/doc/html/rfc5389#section-15.3
-            Err(err) => Err(Error::Other(format!(
-                "failed to decode USERNAME from STUN message as UTF-8: {err}"
-            ))),
-            Ok(s) => {
-                // s is a combination of the local_ufrag and the remote ufrag separated by `:`.
-                let res = if local_ufrag {
-                    s.split(':').next()
-                } else {
-                    s.split(':').next_back()
-                };
-                match res {
-                    Some(s) => Ok(s.to_owned()),
-                    None => Err(Error::Other("can't get ufrag from username".into())),
-                }
-            }
-        }
+    fn wrap_tcp_listener(
+        &self,
+        listener: std::net::TcpListener,
+    ) -> io::Result<Arc<dyn AsyncTcpListener>> {
+        self.inner.wrap_tcp_listener(listener)
+    }
+
+    fn connect_tcp<'a>(
+        &'a self,
+        remote_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn AsyncTcpStream>>> + Send + 'a>> {
+        self.inner.connect_tcp(remote_addr)
+    }
+
+    fn resolve_host<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send + 'a>> {
+        self.inner.resolve_host(host)
+    }
+
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.inner.sleep(duration)
+    }
+
+    fn interval(&self, period: Duration) -> Box<dyn AsyncInterval> {
+        self.inner.interval(period)
+    }
+
+    fn block_on(&self, future: Pin<Box<dyn Future<Output = ()> + '_>>) {
+        self.inner.block_on(future)
+    }
+
+    fn yield_now(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.inner.yield_now()
+    }
+
+    fn name(&self) -> &'static str {
+        "tokio-udp-mux"
     }
 }
 
-#[derive(Error, Debug)]
-enum ConnQueryError {
-    #[error("ufrag is already taken (associated_addrs={associated_addrs:?})")]
-    UfragAlreadyTaken { associated_addrs: Vec<SocketAddr> },
+/// Gets one half of the `local:remote` ICE username from a STUN message.
+fn ufrag_from_stun_message(buffer: &[u8], local_ufrag: bool) -> io::Result<String> {
+    let mut message = STUNMessage::new();
+    message
+        .unmarshal_binary(buffer)
+        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
+
+    let (attr, found) = message.attributes.get(ATTR_USERNAME);
+    if !found {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "no username attribute in STUN message",
+        ));
+    }
+
+    let username =
+        String::from_utf8(attr.value).map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
+    let (first, second) = username.split_once(':').ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "ICE username does not contain two ufrags",
+        )
+    })?;
+
+    Ok(if local_ufrag { first } else { second }.to_owned())
 }
