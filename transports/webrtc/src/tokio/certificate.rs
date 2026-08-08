@@ -19,7 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use rand::{CryptoRng, Rng};
-use webrtc::peer_connection::certificate::RTCCertificate;
+use webrtc::peer_connection::RTCCertificate;
 
 use crate::tokio::fingerprint::Fingerprint;
 
@@ -92,7 +92,7 @@ pub struct Error(#[from] Kind);
 #[derive(thiserror::Error, Debug)]
 enum Kind {
     #[error(transparent)]
-    InvalidPEM(#[from] webrtc::Error),
+    InvalidPEM(#[from] webrtc::error::Error),
 }
 
 #[cfg(all(test, feature = "pem"))]

@@ -25,45 +25,26 @@ use std::{
 };
 
 use futures::{
-    StreamExt,
-    channel::{
-        mpsc,
-        oneshot::{self, Sender},
-    },
-    future::BoxFuture,
-    lock::Mutex as FutMutex,
-    ready,
+    StreamExt, channel::mpsc, future::BoxFuture, lock::Mutex as FutMutex, ready,
     stream::FuturesUnordered,
 };
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use webrtc::{
-    data::data_channel::DataChannel as DetachedDataChannel, data_channel::RTCDataChannel,
-    peer_connection::RTCPeerConnection,
+    data_channel::{DataChannel, DataChannelEvent},
+    peer_connection::{PeerConnection, PeerConnectionEventHandler},
+    runtime::Runtime,
 };
 
 use crate::tokio::{error::Error, stream, stream::Stream};
 
-/// Maximum number of unprocessed data channels.
-/// See [`Connection::poll_inbound`].
 const MAX_DATA_CHANNELS_IN_FLIGHT: usize = 10;
 
-/// A WebRTC connection, wrapping [`RTCPeerConnection`] and implementing [`StreamMuxer`] trait.
+/// A WebRTC connection implementing libp2p's stream muxer interface.
 pub struct Connection {
-    /// [`RTCPeerConnection`] to the remote peer.
-    ///
-    /// Uses futures mutex because used in async code (see poll_outbound and poll_close).
-    peer_conn: Arc<FutMutex<RTCPeerConnection>>,
-
-    /// Channel onto which incoming data channels are put.
-    incoming_data_channels_rx: mpsc::Receiver<Arc<DetachedDataChannel>>,
-
-    /// Future, which, once polled, will result in an outbound stream.
-    outbound_fut: Option<BoxFuture<'static, Result<Arc<DetachedDataChannel>, Error>>>,
-
-    /// Future, which, once polled, will result in closing the entire connection.
+    peer_conn: Arc<dyn PeerConnection>,
+    incoming_data_channels_rx: mpsc::Receiver<Arc<dyn DataChannel>>,
+    outbound_fut: Option<BoxFuture<'static, Result<Arc<dyn DataChannel>, Error>>>,
     close_fut: Option<BoxFuture<'static, Result<(), Error>>>,
-
-    /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<stream::DropListener>,
     no_drop_listeners_waker: Option<Waker>,
 }
@@ -71,79 +52,18 @@ pub struct Connection {
 impl Unpin for Connection {}
 
 impl Connection {
-    /// Creates a new connection.
-    pub(crate) async fn new(rtc_conn: RTCPeerConnection) -> Self {
-        let (data_channel_tx, data_channel_rx) = mpsc::channel(MAX_DATA_CHANNELS_IN_FLIGHT);
-
-        Connection::register_incoming_data_channels_handler(
-            &rtc_conn,
-            Arc::new(FutMutex::new(data_channel_tx)),
-        )
-        .await;
-
+    pub(crate) fn new(
+        peer_conn: Arc<dyn PeerConnection>,
+        incoming_data_channels_rx: mpsc::Receiver<Arc<dyn DataChannel>>,
+    ) -> Self {
         Self {
-            peer_conn: Arc::new(FutMutex::new(rtc_conn)),
-            incoming_data_channels_rx: data_channel_rx,
+            peer_conn,
+            incoming_data_channels_rx,
             outbound_fut: None,
             close_fut: None,
-            drop_listeners: FuturesUnordered::default(),
+            drop_listeners: FuturesUnordered::new(),
             no_drop_listeners_waker: None,
         }
-    }
-
-    /// Registers a handler for incoming data channels.
-    ///
-    /// NOTE: `mpsc::Sender` is wrapped in `Arc` because cloning a raw sender would make the channel
-    /// unbounded. "The channel’s capacity is equal to buffer + num-senders. In other words, each
-    /// sender gets a guaranteed slot in the channel capacity..."
-    /// See <https://docs.rs/futures/latest/futures/channel/mpsc/fn.channel.html>
-    async fn register_incoming_data_channels_handler(
-        rtc_conn: &RTCPeerConnection,
-        tx: Arc<FutMutex<mpsc::Sender<Arc<DetachedDataChannel>>>>,
-    ) {
-        rtc_conn.on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
-            tracing::debug!(channel=%data_channel.id(), "Incoming data channel");
-
-            let tx = tx.clone();
-
-            Box::pin(async move {
-                data_channel.on_open({
-                    let data_channel = data_channel.clone();
-                    Box::new(move || {
-                        tracing::debug!(channel=%data_channel.id(), "Data channel open");
-
-                        Box::pin(async move {
-                            let data_channel = data_channel.clone();
-                            let id = data_channel.id();
-                            match data_channel.detach().await {
-                                Ok(detached) => {
-                                    let mut tx = tx.lock().await;
-                                    if let Err(e) = tx.try_send(detached.clone()) {
-                                        tracing::error!(channel=%id, "Can't send data channel: {}", e);
-                                        // We're not accepting data channels fast enough =>
-                                        // close this channel.
-                                        //
-                                        // Ideally we'd refuse to accept a data channel
-                                        // during the negotiation process, but it's not
-                                        // possible with the current API.
-                                        if let Err(e) = detached.close().await {
-                                            tracing::error!(
-                                                channel=%id,
-                                                "Failed to close data channel: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(channel=%id, "Can't detach data channel: {}", e);
-                                }
-                            };
-                        })
-                    })
-                });
-            })
-        }));
     }
 }
 
@@ -155,29 +75,17 @@ impl StreamMuxer for Connection {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        match ready!(self.incoming_data_channels_rx.poll_next_unpin(cx)) {
-            Some(detached) => {
-                tracing::trace!(stream=%detached.stream_identifier(), "Incoming stream");
+        let Some(data_channel) = ready!(self.incoming_data_channels_rx.poll_next_unpin(cx)) else {
+            return Poll::Pending;
+        };
 
-                let (stream, drop_listener) = Stream::new(detached);
-                self.drop_listeners.push(drop_listener);
-                if let Some(waker) = self.no_drop_listeners_waker.take() {
-                    waker.wake()
-                }
-
-                Poll::Ready(Ok(stream))
-            }
-            None => {
-                debug_assert!(
-                    false,
-                    "Sender-end of channel should be owned by `RTCPeerConnection`"
-                );
-
-                // Return `Pending` without registering a waker: If the channel is
-                // closed, we don't need to be called anymore.
-                Poll::Pending
-            }
+        tracing::trace!(channel=%data_channel.id(), "Incoming stream");
+        let (stream, drop_listener) = Stream::new(data_channel);
+        self.drop_listeners.push(drop_listener);
+        if let Some(waker) = self.no_drop_listeners_waker.take() {
+            waker.wake();
         }
+        Poll::Ready(Ok(stream))
     }
 
     fn poll(
@@ -187,9 +95,7 @@ impl StreamMuxer for Connection {
         loop {
             match ready!(self.drop_listeners.poll_next_unpin(cx)) {
                 Some(Ok(())) => {}
-                Some(Err(e)) => {
-                    tracing::debug!("a DropListener failed: {e}")
-                }
+                Some(Err(err)) => tracing::debug!("a DropListener failed: {err}"),
                 None => {
                     self.no_drop_listeners_waker = Some(cx.waker().clone());
                     return Poll::Pending;
@@ -202,61 +108,37 @@ impl StreamMuxer for Connection {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        let peer_conn = self.peer_conn.clone();
+        let peer_conn = Arc::clone(&self.peer_conn);
         let fut = self.outbound_fut.get_or_insert_with(|| {
             Box::pin(async move {
-                let peer_conn = peer_conn.lock().await;
-
                 let data_channel = peer_conn.create_data_channel("", None).await?;
-
-                // No need to hold the lock during the DTLS handshake.
-                drop(peer_conn);
-
                 tracing::trace!(channel=%data_channel.id(), "Opening data channel");
-
-                let (tx, rx) = oneshot::channel::<Arc<DetachedDataChannel>>();
-
-                // Wait until the data channel is opened and detach it.
-                register_data_channel_open_handler(data_channel, tx).await;
-
-                // Wait until data channel is opened and ready to use
-                match rx.await {
-                    Ok(detached) => Ok(detached),
-                    Err(e) => Err(Error::Internal(e.to_string())),
-                }
+                await_data_channel_open(data_channel).await
             })
         });
 
         match ready!(fut.as_mut().poll(cx)) {
-            Ok(detached) => {
+            Ok(data_channel) => {
                 self.outbound_fut = None;
-
-                tracing::trace!(stream=%detached.stream_identifier(), "Outbound stream");
-
-                let (stream, drop_listener) = Stream::new(detached);
+                let (stream, drop_listener) = Stream::new(data_channel);
                 self.drop_listeners.push(drop_listener);
                 if let Some(waker) = self.no_drop_listeners_waker.take() {
-                    waker.wake()
+                    waker.wake();
                 }
-
                 Poll::Ready(Ok(stream))
             }
-            Err(e) => {
+            Err(err) => {
                 self.outbound_fut = None;
-                Poll::Ready(Err(e))
+                Poll::Ready(Err(err))
             }
         }
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        tracing::debug!("Closing connection");
-
-        let peer_conn = self.peer_conn.clone();
+        let peer_conn = Arc::clone(&self.peer_conn);
         let fut = self.close_fut.get_or_insert_with(|| {
             Box::pin(async move {
-                let peer_conn = peer_conn.lock().await;
                 peer_conn.close().await?;
-
                 Ok(())
             })
         });
@@ -267,40 +149,70 @@ impl StreamMuxer for Connection {
                 self.close_fut = None;
                 Poll::Ready(Ok(()))
             }
-            Err(e) => {
+            Err(err) => {
                 self.close_fut = None;
-                Poll::Ready(Err(e))
+                Poll::Ready(Err(err))
             }
         }
     }
 }
 
-pub(crate) async fn register_data_channel_open_handler(
-    data_channel: Arc<RTCDataChannel>,
-    data_channel_tx: Sender<Arc<DetachedDataChannel>>,
-) {
-    data_channel.on_open({
-        let data_channel = data_channel.clone();
-        Box::new(move || {
-            tracing::debug!(channel=%data_channel.id(), "Data channel open");
+pub(crate) struct ConnectionHandler {
+    incoming_tx: Arc<FutMutex<mpsc::Sender<Arc<dyn DataChannel>>>>,
+    runtime: Arc<dyn Runtime>,
+}
 
-            Box::pin(async move {
-                let data_channel = data_channel.clone();
-                let id = data_channel.id();
-                match data_channel.detach().await {
-                    Ok(detached) => {
-                        if let Err(e) = data_channel_tx.send(detached.clone()) {
-                            tracing::error!(channel=%id, "Can't send data channel: {:?}", e);
-                            if let Err(e) = detached.close().await {
-                                tracing::error!(channel=%id, "Failed to close data channel: {}", e);
-                            }
+impl ConnectionHandler {
+    pub(crate) fn new(
+        runtime: Arc<dyn Runtime>,
+    ) -> (Arc<Self>, mpsc::Receiver<Arc<dyn DataChannel>>) {
+        let (incoming_tx, incoming_rx) = mpsc::channel(MAX_DATA_CHANNELS_IN_FLIGHT);
+        (
+            Arc::new(Self {
+                incoming_tx: Arc::new(FutMutex::new(incoming_tx)),
+                runtime,
+            }),
+            incoming_rx,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for ConnectionHandler {
+    async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+        let incoming_tx = Arc::clone(&self.incoming_tx);
+        self.runtime.spawn(Box::pin(async move {
+            let channel_id = data_channel.id();
+            match await_data_channel_open(data_channel).await {
+                Ok(data_channel) => {
+                    let mut tx = incoming_tx.lock().await;
+                    if let Err(err) = tx.try_send(data_channel.clone()) {
+                        tracing::error!(channel=%channel_id, "Can't queue data channel: {err}");
+                        if let Err(err) = data_channel.close().await {
+                            tracing::error!(channel=%channel_id, "Failed to close data channel: {err}");
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(channel=%id, "Can't detach data channel: {}", e);
-                    }
-                };
-            })
-        })
-    });
+                }
+                Err(err) => tracing::debug!(channel=%channel_id, "Data channel failed to open: {err}"),
+            }
+        }));
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn await_data_channel_open(
+    data_channel: Arc<dyn DataChannel>,
+) -> Result<Arc<dyn DataChannel>, Error> {
+    loop {
+        match data_channel.poll().await {
+            Some(DataChannelEvent::OnOpen) => return Ok(data_channel),
+            Some(DataChannelEvent::OnError) => {
+                return Err(Error::Internal("data channel failed to open".into()));
+            }
+            Some(DataChannelEvent::OnClosing | DataChannelEvent::OnClose) | None => {
+                return Err(Error::Internal("data channel closed before opening".into()));
+            }
+            Some(_) => {}
+        }
+    }
 }

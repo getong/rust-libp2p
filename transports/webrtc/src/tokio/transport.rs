@@ -33,7 +33,7 @@ use libp2p_core::{
 };
 use libp2p_identity as identity;
 use libp2p_identity::PeerId;
-use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::{RTCConfiguration, RTCConfigurationBuilder};
 
 use crate::tokio::{
     certificate::Certificate,
@@ -373,10 +373,9 @@ impl Config {
 
         Self {
             id_keys,
-            inner: RTCConfiguration {
-                certificates: vec![certificate.to_rtc_certificate()],
-                ..RTCConfiguration::default()
-            },
+            inner: RTCConfigurationBuilder::new()
+                .with_certificates(vec![certificate.to_rtc_certificate()])
+                .build(),
             fingerprint,
         }
     }

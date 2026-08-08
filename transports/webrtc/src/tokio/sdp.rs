@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 
 pub(crate) use libp2p_webrtc_utils::sdp::random_ufrag;
 use libp2p_webrtc_utils::{Fingerprint, sdp::render_description};
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCSessionDescription;
 
 /// Creates the SDP answer used by the client.
 pub(crate) fn answer(

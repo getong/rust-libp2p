@@ -25,7 +25,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum Error {
     #[error(transparent)]
-    WebRTC(#[from] webrtc::Error),
+    WebRTC(#[from] webrtc::error::Error),
     #[error("IO error")]
     Io(#[from] std::io::Error),
     #[error("failed to authenticate peer")]
